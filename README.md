@@ -116,9 +116,94 @@ function watch(obj, name = 'obj', depth = 0) {
 
 #### 2.2.2 解法二：AST 解混淆
 
-（比较懒，后面补）
+> 思路：用 Babel（`@babel/parser` + `@babel/traverse` + `@babel/generator` + `@babel/types`）把混淆代码解析成 AST，
+> 按结构特征捕捉关键片段，最后用 `generate` 重新输出接近明文的代码。
+> 依赖安装：`npm install @babel/parser @babel/traverse @babel/generator @babel/types`
 
-思路预告：用 AST 解析代码将数组解密（`_0x3502[...]` 字符串还原）+ 变量名还原，得到接近明文的代码，再人工阅读 `go()` 入口参数与 `hash()` 的算法逻辑。
+**混淆代码结构识别**（obfuscator 三件套）：
+
+```
+① var _0x39e0 = ['fcKWw6fDmQ==', ...]        ← 长字符串数组（259 个元素）
+② (function(...){ push/shift 循环 })(_0x39e0, 0x1ed)  ← 洗牌自执行函数（打乱数组顺序，次数写死故结果确定）
+③ var _0x510c = function(...){ ... }          ← 解码函数（读数组 + 缓存 + base64/RC4 解密，函数体 6 条语句）
+   之后所有字符串都用 _0x510c('0x16','S9ax') 这种形式间接引用
+```
+
+**Step 1：按结构特征提取三段代码**（先数组 → 再洗牌 → 再解码函数，顺序由依赖决定）
+
+```js
+traverse(ast, {
+    VariableDeclaration(path) {                       // 捕数组 + 解码函数
+        const init = path.node.declarations[0].init;
+        if (type.isArrayExpression(init) && init.elements.length > 50) {
+            parts.array = generate(path.node).code;   // 长数组
+        } else if (type.isFunctionExpression(init) && init.body.body.length === 6) {
+            DecodingCodeName = path.node.declarations[0].id.name;
+            parts.decode = generate(path.node).code;  // 解码函数
+        }
+    }
+});
+traverse(ast, {
+    ExpressionStatement(path) {                       // 捕洗牌 IIFE
+        const callee = path.node.expression && path.node.expression.callee;
+        if (type.isFunctionExpression(callee) && callee.body.body.length === 2) {
+            parts.shuffle = generate(path.node).code;
+        }
+    }
+});
+```
+
+**Step 2：拼成可执行环境文件**（顺序：数组 → 洗牌 → 解码函数，再 `module.exports` 导出）
+
+```js
+const code = [parts.array, parts.shuffle, parts.decode,
+              "module.exports = " + DecodingCodeName + ";"].join('\n');
+fs.writeFileSync("./decode_env.js", code, "utf-8");
+
+delete require.cache[require.resolve("./decode_env.js")];  // 清缓存，加载刚写的新版
+const get_value = require("./decode_env.js");              // 得到可调用的解码函数
+```
+
+**Step 3：遍历替换调用点**：`CallExpression` 里 `callee.name === DecodingCodeName` 且两个参数都是字符串字面量时，当场求值并 `replaceWith` 成字符串节点
+
+```js
+traverse(ast, {
+    CallExpression(path) {
+        const node = path.node;
+        if (node.callee.name === DecodingCodeName && node.arguments.length === 2) {
+            const [a1, a2] = node.arguments;
+            if (type.isStringLiteral(a1) && type.isStringLiteral(a2)) {
+                path.replaceWith(type.stringLiteral(get_value(a1.value, a2.value)));
+            }
+        }
+    }
+});
+```
+
+**Step 4：合并字符串 `+` 二元拼接**（`('_')+('_')+...` 这类合并成整串）
+
+```js
+traverse(ast, {
+    BinaryExpression(path) {
+        const node = path.node;
+        if (type.isStringLiteral(node.left) && type.isStringLiteral(node.right)
+            && node.operator === "+") {
+            path.replaceWith(type.stringLiteral(node.left.value + node.right.value));
+        }
+    }
+});
+```
+
+**最终输出**：`fs.writeFileSync("结果.js", generate(ast).code, "utf-8")`
+
+**实战效果**（对比 `ob.js` 27KB → `结果.js` 23.8KB）：
+**PS** 结果中还有一些二元运算没有匹配到如果想要匹配到可以写一个递归去依次解决二元表达式，这里解混淆只是为了让代码好看对于最终解决还需看源码的复杂度，还是插桩补环境好用点
+```
+剩余解码调用 _0x510c(: 0   ← 268 处调用全部还原为真实字符串
+剩余字符串拼接: 0          ← 表达式合并完毕
+```
+
+<!-- 此处待补充 AST 解混淆实战截图 -->
 
 ## 三、最终结果
 
